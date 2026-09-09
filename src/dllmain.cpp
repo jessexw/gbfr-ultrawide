@@ -1,178 +1,7 @@
-// GBFRUltrawide - ultrawide fix for Granblue Fantasy Relink v2.0.4
+// GBFRUltrawide - ultrawide support for Granblue Fantasy Relink.
 // Derived from Lyall's GBFRelinkFix (https://codeberg.org/Lyall/GBFRelinkFix), MIT License.
-// Changes vs upstream: spdlog removed (minimal built-in logger), renamed to GBFRUltrawide,
-// explicit HIT/MISS logging for every pattern scan, nullptr-safe scan handling.
-//
-// ===== v2.0.4 migration note (module timestamp 1784194605/0x6A58A62D -> 1785723813/0x6A6FFBA5) =====
-// The v2.0.4 update recompiled the exe again: every RVA shifted, but ALL 29 byte-signature
-// patterns still match and every hook still lands on the same instruction (offline-verified).
-// Pattern-derived sites self-heal (addresses resolved from the matched instruction), so only
-// the HARDCODED statics below were re-pinned for v2.0.4. Unlike v2.0.3's per-region deltas,
-// v2.0.4 was a UNIFORM .data rebase: every hardcoded static shifted by exactly +0x1280
-// (verified across 6 independent addresses - old addrs went dead, the +0x1280 addrs revived
-// with matching xref counts; e.g. g_pCamCtx0 xrefs 43 -> 4 at the old addr, 43 at +0x1280):
-//   - g_pCamCtx0 (CamDistCommit main-view guard): 0x07C22320 -> 0x07C235A0
-//   - DiagDump resolution/quality/swapchain globals: 0x06B8xxxx / 0x0701xxxx region +0x1280
-//     (quality table 0x06B811E0 -> 0x06B82460), 0x07033490 -> 0x07034710,
-//     swapchain 0x0718FFF8/0x07190000 -> 0x07191278/0x07191280, uiCachedW 0x0701E250 -> 0x0701F4D0
-//   - DiagCam2Watchdog statics (dev-only): 0x07C2xxxx region +0x1280
-// Deltas by version: v2.0.3->v2.0.4 uniform +0x1280; earlier v2.0.2->v2.0.3 was per-region
-// (0x07C2xxxx -0x3040, 0x06B8xxxx -0x3030, 0x054Bxxxx -0x4060).
-// Other RVAs in this file's comments are kept as v2.0.2 provenance; see docs/PATTERNS.md.
-// ====================================================================================================
-
-// === PATTERN STATUS (game v2.0.2) ===
-// Patterns are verbatim from Lyall's GBFRelinkFix v1.1.1 (written for game v1.x).
-// Status below reflects Zydis instruction-level disassembly verification against
-// game v2.0.2. Dead patterns are kept as-is on purpose and will be updated one by
-// one; a MISS only disables that feature.
-//
-// IMPORTANT - v2.0.2 UI object struct shifted -0x38 vs v1:
-//   width 0x1F4 -> 0x1BC | height 0x1F8 -> 0x1C0 | object ID 0x1FC -> 0x1C4
-//   offsX 0x1CC -> 0x194 | offsY  0x1D0 -> 0x198 | our marker 0x200 -> 0x1C8
-//
-// Alive on v2.0.2:
-//   [OK]    Resolution      (ApplyResolution)  - verified; 2 hits (two inlined copies), BOTH hooked at +0x25
-//                                                (diagnostic: runtime showed hooks install but 21:9 not applied,
-//                                                so we no longer assume the first copy is the live path)
-//   [OK]    ScreenEffects   (GraphicalFixes)   - verified; hook at +0xB
-//   [NEW 2026-07-11] GaussBackdropTiling (GraphicalFixes) - issue #3: imm patch (renderH cmp 0x438 -> 0 @ RVA
-//                                                0x0330EF2B, the per-frame viewport reader) forcing the pause/modal
-//                                                blur backdrop's projection down the canonical-1920x1080 path that
-//                                                the working wide resolutions use, instead of the renderH==1080
-//                                                arm that stretches the 1920-wide GaussScaledTarget across a wider
-//                                                backbuffer; gated iCustomResX>1920 && iCustomResY<=1080 (PATTERNS.md 3.29)
-//   [FIXED] UIBackgrounds   (HUDFix)           - base at +0x2F; >16:9 hook (base+0x0) now writes xmm1 (v2 loads width
-//                                                into xmm1; xmm0 is overwritten right after), <16:9 hook moved
-//                                                base+0x28 -> base+0x29 (v1 offset landed inside an 8-byte vmovss);
-//                                                lambda struct offsets shifted -0x38
-//   [REWORKED 2026-07-10] HUDConstraints (HUDFix) - hook at +0x1C unchanged (rcx = child element, rax = parent
-//                                                canvas, xmm2/xmm0 = parent w/h), but the v1 ID-gated body was
-//                                                inert on v2 (v1 object IDs never appear; +0x194/+0x198 are
-//                                                normalized anchors, not pixel offsets). Body replaced with the
-//                                                three-layer menu/story filter + full-canvas register widen +
-//                                                Combat Prompts recenter, derived from independent analysis of
-//                                                the v2.0.2 exe (build 0x6A3E573A) and cross-validated against
-//                                                community ultrawide research. See HUDFix() for details.
-//   [FIXED] ShadowQuality   (GraphicalTweaks)  - hook moved scan+0x0 -> scan-0x1 (v2 adds REX.X prefix 0x42, pattern
-//                                                hits mid-instruction); addressing now rax+r8 (was rcx+rdx)
-//   [OK]    TemporalAA      (GraphicalTweaks)  - verified; byte patch, not a hook
-//   [FIXED] CutsceneFOV     (AspectFOVFix)     - hook moved +0xC -> +0x1C (v2 loads xmm2 at +0x14; patching earlier
-//                                                gets overwritten); 4 identical inline hits, first one hooked
-//   [REFOUND v2.0.2] AspectRatio (AspectFOVFix) - new pattern, only byte[2] 49->48 vs v1 (reg alloc change);
-//                                                hook at +0x11 unchanged; verified unique hit RVA 0x00751089
-//   [REFOUND v2.0.2] UIAspect    (HUDFix)       - v1 single pattern replaced by two patterns/sites: patch site
-//                                                RVA 0x00231BDD (P1+0xC: 0F 85 -> 90 E9) + hook site RVA
-//                                                0x00231F10 (P2+0xA); both must hit or the fix is skipped
-//   [REWORKED v2.0.2] UIMarkers  (HUDFix)       - v1 site (RVA 0x026812CD) is a DEAD corner-widget path in v2:
-//                                                HIT but never FIRED in combat (diagnosed 2026-07-10). The real
-//                                                world->screen widget math is inlined 51x and reads the GLOBAL
-//                                                canvas manager [0x07C02358]; its positioning assumes
-//                                                canvasW*scale == windowW, an invariant the CanvasFitHeight
-//                                                patch broke (=> uniform +440px right shift of health bars /
-//                                                damage numbers / lock-on at 3440x1440). Fix "UIMarkersCanvas":
-//                                                hook the CanvasFitHeight scale-store site at +0x40 (rax =
-//                                                canvas manager) and write BOTH source W/H (+0x1B4/+0x1B8)
-//                                                and current W/H (+0x1BC/+0x1C0) = 2160*aspect (>16:9) or
-//                                                3840/aspect (<16:9). +0x1BC alone gets washed back to 3840
-//                                                by the dirty-layout recalc (RVA 0x0261C5D0), which copies
-//                                                +0x1B4 over it every dirty frame; writing the source field
-//                                                makes the recalc propagate our value instead. (ADR-0006)
-//   [REFOUND v2.0.2] GfxCorruption1 (GraphicalFixes) - new pattern, 4 hits (branch arms of one function) and ALL
-//                                                are hooked at +0x8 (was: first hit @ +0x0). Hooked value is
-//                                                width/64, not width/32 as v1 assumed; Cygames' v2.0.2 code
-//                                                already ceils the w/32 & h/30 lanes itself (new vroundss),
-//                                                only lane0 (w/64) is still stored raw - our hook fixes it
-//   [REFOUND v2.0.2] GfxCorruption2 (GraphicalFixes) - new pattern, 2 hits (alloc success/fallback arms), both
-//                                                hooked at +0x8; same lane0 = width/64 fix as GfxCorruption1
-//   [REMOVED 2026-07-10] GameplayCamera (AspectFOVFix) - the v2-relocated message-block site (unique hit RVA
-//                                                0x009D8C70) HIT but its distance hook never FIRED in any
-//                                                session: v2.0.2 gameplay no longer drives the camera through
-//                                                that message path. Hook deleted (it would double-multiply the
-//                                                distance vs the CamDist* families below if the path ever
-//                                                revives). Historical notes - incl. the "v1 FOV slot is now
-//                                                pitch, hooking it tilts the camera" trap - kept in
-//                                                docs/PATTERNS.md 3.6.
-//   [NEW 2026-07-10] ProjMatrixFOV (AspectFOVFix) - THE rendered gameplay-FOV multiplier (ADR-0011): mid-hook
-//                                                inside the projection-matrix builder (expected RVA 0x00750970,
-//                                                hook at pattern+0x1A = the tanf call; xmm0 = FOV/2 at entry):
-//                                                xmm0 *= fFOVMulti before tan(). Serves EVERY camera incl.
-//                                                cutscenes - the multiplier is global by design. Register-only;
-//                                                [obj+0x9D4] is never written (14+ writers, compounding hazard).
-//   [ROLE CHANGE 2026-07-10] ViewParamsFOV (AspectFOVFix) - does NOT affect the rendered projection: its xmm3
-//                                                only feeds the culling/shared-view-constants call (0x0216ABE0);
-//                                                the builder above re-reads FOV from memory. KEPT (same site,
-//                                                RVA 0x0075109A, hook +0x20, xmm3 *= fFOVMulti) so the culling
-//                                                path sees the same multiplied FOV as ProjMatrixFOV - without
-//                                                it, multipliers > 1 pop objects at the screen edges. ADR-0011.
-//   [NEW 2026-07-10] CamDistPreset / FollowCamDist / RoamCamDist (AspectFOVFix) - camera distance multiplier,
-//                                                three live hook families replacing the dead GameplayCamera
-//                                                site: preset publish to the global camera-params block
-//                                                (4 hits, ALL hooked at +0x5, xmm0, meters), follow-cam zoom
-//                                                track (unique hit, +0x23, xmm8, normalized 0..1), free-roam
-//                                                config copy (unique hit, +0x5, xmm0). Derived from community
-//                                                ultrawide research for this exe build, re-verified offline.
-//                                                STATUS UPDATE (offline hunt 2026-07-10, CAMDIST_HUNT2): none
-//                                                of the three ever FIRED in the field, and the CamDistPreset
-//                                                publish target 0x07C25720 is mainView+0x3C0 - a COLD preset
-//                                                tail with zero rip-visible readers. Kept for lineage; the
-//                                                live-path is CamDistCommit below.
-//   [SHIPPING 2026-07-11] CamDistCommit (CamDistCommit) - THE camera-distance multiplier ([Gameplay Camera
-//                                                Distance] Multiplier), both build flavors (ADR-0013;
-//                                                PATTERNS.md 2.9/3.24/3.26). Mid-hook at the register-base
-//                                                per-frame committed-eye store RVA 0x00692497 (inside writer
-//                                                function 0x00691F60), hook +0x0. rsi=ctx, xmm0=eye, xmm1=at.
-//                                                Form A: guard rsi == baseModule+0x07C25360 (MAIN VIEW ONLY;
-//                                                9 aux views untouched), then xmm0.xyz = xmm1 + (xmm0-xmm1)*m
-//                                                (w kept). Register-only, no memory writes; installed only
-//                                                when m != 1.0 (zero overhead at 1.0). One commit per view
-//                                                per frame -> no idempotency guard. GAMEPLAY-ONLY BY GATE:
-//                                                the writer's entry gate [rcx+0xC0] closes in cutscenes/
-//                                                dialogue, so this does NOT touch scripted framing (unlike
-//                                                ProjMatrixFOV/ADR-0011, which does affect cutscenes). Known
-//                                                limitation: wall-collision is computed upstream, so m > 1
-//                                                can clip the eye into walls. Confidence HIGH (offline hunt +
-//                                                in-game FIRED verification 2026-07-11). SUPERSEDES the old
-//                                                rip-relative 4-site "CamCommitDist" (0x01A2D8F3 / 0x01F4185F
-//                                                / 0x01FF3AAC / 0x0320150C), which was field-proven DEAD
-//                                                (0 fires) and has been REMOVED (docs/PATTERNS.md 3.24 note).
-//   [DEV 2026-07-10] DIAG-CAM2  ([Debug - Camera] CamDiag, dev builds only) - observation instrumentation
-//                                                for the camera-distance work: watchdog sampling committed/
-//                                                staged |eye-at| off the view-ctx statics; the LIVE commit
-//                                                counters (fires_ctx0/fires_other/gateskip/|eye-at|, stream F)
-//                                                come from the shipping CamDistCommit eye-store hook itself
-//                                                (same 0x00692497 mid-hook, counting when CamDiag) plus a
-//                                                dev-only entry counter on 0x00691F60; behavior object
-//                                                [0x07C25438] type/+0x1398 sampling, id-6 camera-message
-//                                                consumer counter (RVA 0x00A840D7, count only), and mode flag
-//                                                bytes 0x07C25711/13. Replaces the retired DIAG-CAMDIST
-//                                                watchdog (0x07C25720 is the cold ctx+0x3C0 preset tail).
-//   [NEW 2026-07-10] Nameplate    (NameplateFix) - world-anchored nameplate horizontal scale (expected RVA
-//                                                0x00847F6B, hook at pattern+0x3C right after "vdivss
-//                                                xmm1,xmm7,[rax+0x9D0]"): xmm1 = xmm7 / live fAspectRatio.
-//                                                Derived from independent analysis of the v2.0.2 exe.
-//   [REFOUND v2.0.2] LODDistance (GraphicalTweaks) - v1 site compiled away; semantically relocated to the
-//                                                per-object LOD threshold loop (unique hit RVA 0x020E56C0),
-//                                                hook +0x0 -> +0x8 (after the 8-byte vdivss), xmm1 -> xmm2.
-//                                                Confidence: MEDIUM - needs in-game verification; fallback
-//                                                candidate RVA 0x0322ADDE (see hunt_lod_fpscap.txt)
-//   [REWORKED 2026-07-11] FPSCap (FPSCap)         - v2 limiter loads frame time (double) from 3-entry table
-//                                                (1/30, 1/60, 1/120 @ RVA 0x054D6BF0) into xmm10 then spins on
-//                                                vucomisd+pause. Pattern @ RVA 0x001B6E63. NO HOOK anymore: the
-//                                                v1-style mid-hook at +0xC overlapped the spin-loop head at
-//                                                +0xD (back-edge jumps into the patch bytes) - replaced by a
-//                                                data patch of the table's 1/120 entry -> 1/240 (unique reader,
-//                                                re-read every frame). 240 is the engine ceiling (timestep
-//                                                scale clamps at 0.25 = 60/240). Issue #4 / ADR-0014.
-//
-// MISS on v2.0.2: none - all v1 patterns relocated or replaced (GameplayCamera deleted as a dead
-// site), plus the v2-native patterns ViewParamsFOV, ProjMatrixFOV, Nameplate, CamDistPreset,
-// FollowCamDist, RoamCamDist and CamDistCommit. The gameplay FOV multiplier is served by
-// ProjMatrixFOV (with ViewParamsFOV keeping culling consistent); the camera distance multiplier
-// by CamDistCommit (the register-base committed-eye writer; the three older CamDist* families
-// never fired in the field, and the old rip-relative 4-site CamCommitDist was removed as dead);
-// only the <16:9 vert- FOV compensation remains unported.
-// =====================================
+// Camera distance is applied only at the main-view committed-eye writer.
+// Scripted camera state suppresses distance scaling until normal framing resumes.
 
 #include "stdafx.h"
 #include "helper.hpp"
@@ -184,8 +13,6 @@ HMODULE baseModule = GetModuleHandle(NULL);
 // Logger and config setup
 inipp::Ini<char> ini;
 std::string sFixName = "GBFRUltrawide";
-// Stamped at build time: CI passes the release tag via CMake (GBFR_VERSION);
-// local builds fall back to 0.0.0-dev, marking unofficial binaries in user logs.
 #ifndef GBFR_VERSION_STRING
 #define GBFR_VERSION_STRING "0.0.0-dev"
 #endif
@@ -212,6 +39,7 @@ int iCustomResX;
 int iCustomResY;
 float fFOVMulti;
 float fCamDistMulti;
+bool bExcludeScriptedCameras = true;
 bool bHUDFix;
 bool bSpanHUD;
 float fHUDAspectRatio;
@@ -276,14 +104,11 @@ std::atomic<uint32_t> g_MsgCam6Count{ 0 };
 std::atomic<uint32_t> g_MsgCam6LastDistBits{ 0 };
 #endif // GBFR_DEVBUILD
 
-// CamDistCommit (CAMDIST_HUNT3, PATTERNS.md 2.9/3.24, ADR-0013) - the SHIPPING camera
-// distance multiplier. Its single mid-hook lives at the register-base per-frame eye/at
-// committer 0x00691F60's eye store 0x00692497, which every prior disp32-xref hunt missed.
-// The static main-view ctx pointer (base + 0x07C25360) is resolved at install time and
-// only COMPARED against rsi (guarding the main view), never dereferenced through the hook.
-// Used in BOTH build flavors: the multiply guards on rsi==g_pCamCtx0.
+// Primary camera context used to filter the committed-eye hook.
+// Once the context matches, the hook reads its scripted-camera state.
 const uint8_t* g_pCamCtx0 = nullptr;                 // static main-view ctx (rsi==this => main view)
 std::atomic<bool> g_CamDistFiredLog{ false };        // one-shot FIRED marker for the multiply
+std::atomic<bool> g_ScriptedCameraActive{ false };
 
 #ifdef GBFR_DEVBUILD
 // CamDistCommit VERIFICATION counters (dev builds only, armed by [Debug - Camera]
@@ -481,6 +306,7 @@ void ReadConfig()
     inipp::get_value(ini.sections["Custom Resolution"], "Height", iCustomResY);
     inipp::get_value(ini.sections["Gameplay FOV"], "Multiplier", fFOVMulti);
     inipp::get_value(ini.sections["Gameplay Camera Distance"], "Multiplier", fCamDistMulti);
+    inipp::get_value(ini.sections["Gameplay Camera Distance"], "ExcludeScriptedCameras", bExcludeScriptedCameras);
     inipp::get_value(ini.sections["Fix HUD"], "Enabled", bHUDFix);
     inipp::get_value(ini.sections["Span HUD"], "Enabled", bSpanHUD);
     inipp::get_value(ini.sections["Span HUD"], "AspectRatio", fHUDAspectRatio);
@@ -551,6 +377,8 @@ void ReadConfig()
         fCamDistMulti = std::clamp(fCamDistMulti, (float)0.1, (float)2.5);
         LogInfo("Config Parse: fCamDistMulti value invalid, clamped to %g", fCamDistMulti);
     }
+    LogInfo("Config Parse: ExcludeScriptedCameras=%s",
+        bExcludeScriptedCameras ? "true" : "false");
     LogInfo("Config Parse: bHUDFix: %s", bHUDFix ? "true" : "false");
     LogInfo("Config Parse: bSpanHUD: %s", bSpanHUD ? "true" : "false");
     LogInfo("Config Parse: fHUDAspectRatio: %g", fHUDAspectRatio);
@@ -701,12 +529,6 @@ void ApplyResolution()
 {
     if (bCustomResolution)
     {
-        // [OK v2.0.2] Resolution: 2 hits (exe+0x215BFE and exe+0x21B277), two inlined copies
-        // of the same apply logic. Previously only the first hit was hooked; runtime testing
-        // showed the hooks install but 21:9 does not take effect, so to rule out the game
-        // running the OTHER copy, ALL hits are now hooked at +0x25 with the same override.
-        // safetyhook mid-hooks only accept capture-less lambdas, so the two known hits get
-        // distinct lambdas to tell their FIRED diagnostics apart.
         std::vector<uint8_t*> ResolutionScanResults = Memory::PatternScanAll(baseModule, "41 ?? ?? ?? 3C 04 B9 04 00 00 00 0F ?? ?? 0F ?? ??");
         if (!ResolutionScanResults.empty())
         {
@@ -749,17 +571,6 @@ void ApplyResolution()
                         ctx.rax = iCustomResY;
                     }));
             }
-            // v2.0.2: the two hooked sites are NOT the only inlined copies of the
-            // preset->dimensions conversion - runtime testing showed the swapchain is sized
-            // through a copy our pattern cannot catch (different register allocation), so the
-            // screen stayed 16:9 even though both hooks fired ("game wanted 2560x1440").
-            // All copies, however, read the same two 5-entry preset tables in .rdata:
-            //   width  {3840, 2560, 1920, 1600, 1280}
-            //   height {2160, 1440, 1080,  900,  720}
-            // Patching the tables themselves covers every consumer at once. Table addresses
-            // are derived at runtime from hit #1's two rip-relative leas (lea r64,[width]
-            // at +0x11, lea r64,[height] at +0x1B - disp32 at +0x14/+0x1E, next insn at
-            // +0x18/+0x22), then the contents are sanity-checked before writing.
             uint8_t* site = ResolutionScanResults[0];
             if (site[0x11] == 0x48 && site[0x12] == 0x8D && site[0x1B] == 0x48 && site[0x1C] == 0x8D)
             {
@@ -959,23 +770,6 @@ void GraphicalFixes()
             }
         }
 
-        // [NEW 2026-07-11, GitHub issue #3 - the fix] Pause/modal blur backdrop tiling at
-        // renderH==1080. The backdrop replays a projection matrix built each frame by the
-        // viewport reader @ RVA 0x0330EF00 (called from 0x030E3E3E). That reader branches on
-        // render height @ RVA 0x0330EF2B: "cmp [rcx+0x284],0x438 ; jnz 0x0330EF66":
-        //   renderH == 1080 (fall-through) -> builds the projection from the ACTUAL (wide)
-        //       width [rsi+0x280] while the backdrop's source (GaussScaledTarget) stays
-        //       1920-wide -> the 3840/1920 = 2.0 horizontal mismatch -> two squeezed copies
-        //       + black gaps. Purely renderH-gated, so 3840x1080 AND 5120x1080 tile.
-        //   renderH != 1080 (jnz taken, 0x0330EF66) -> normalizes to a canonical 1920x1080
-        //       basis - the correct path 5120x1440 / 3440x1440 already use, hence they are clean.
-        // Fix: patch the compare imm 0x438 -> 0 so renderH (never 0) always takes the jnz /
-        // normalize arm, routing 3840x1080 down the exact path the working resolutions use.
-        // This reader runs EVERY frame (unlike the sibling producer @ 0x0330F55C, whose
-        // setnz is gated behind a resolution-CHANGE early-out and so never ran on a stable
-        // 1080-tall session - that was the earlier failed attempt, PATTERNS.md 3.28/3.29).
-        // Pure imm32 rewrite (same length, no hook). Gated to iCustomResX>1920 &&
-        // iCustomResY<=1080 so native 16:9 1080p (correct as-is) is untouched. PATTERNS.md 3.29.
         if (iCustomResX > 1920 && iCustomResY <= 1080)
         {
             // cmp dword[rcx+0x284],0x438 ; jnz - unique @ RVA 0x0330EF2B. imm32 at +6
@@ -1319,132 +1113,8 @@ void AspectFOVFix()
             });
     }
 
-    // [REMOVED 2026-07-10] GameplayCamera distance hook (v1-relocated message-block
-    // site, unique hit RVA 0x009D8C70, hook +0x8, xmm9 *= fCamDistMulti): the pattern
-    // HIT but the hook never FIRED in any session - v2.0.2 gameplay no longer drives
-    // the camera through that message path. Deleted so the distance cannot be
-    // multiplied TWICE through the live families below if the message path ever
-    // revives. Historical notes - incl. the "v1 FOV slot is now pitch, hooking it
-    // tilts the camera" trap - are kept in docs/PATTERNS.md 3.6.
-    //
-    // [NEW 2026-07-10] Camera distance multiplier - three live hook families, derived
-    // from community ultrawide research for this exe build and re-verified offline
-    // instruction-by-instruction (docs/PATTERNS.md 3.20-3.22). The three sites do not
-    // overlap each other (or anything else we hook), so plain scan+install per family
-    // is safe here - no ordering constraint like the aspect/FOV block above.
-    //
-    // STATUS UPDATE (offline hunt 2026-07-10, CAMDIST_HUNT2 / PATTERNS.md 2.8): none
-    // of the three ever FIRED in the field, and the CamDistPreset publish target
-    // 0x07C25720 is mainView+0x3C0 - the static view ctx's COLD preset tail (zero
-    // rip-visible readers; the DIAG-CAMDIST watchdog saw a constant 4.8 all session).
-    // The live distance is GEOMETRIC (|eye-at| of the commit statics), served by the
-    // shipping CamDistCommit hook (register-base committed-eye writer 0x00692497; see
-    // CamDistCommit() below and ADR-0013). The trio is KEPT installed under the same
-    // gate purely as an early-warning canary: it never fires today, so it cannot
-    // double-scale against CamDistCommit; if a future patch revives one of these paths
-    // its one-shot FIRED line is the earliest possible warning that the distance could
-    // be scaled twice (in which case gate one of the families off).
     if (fCamDistMulti != (float)1)
-    {
-        // F1 - CamDistPreset (primary effect): the four inlined "apply active camera
-        // preset" sites that publish the preset's distance [rcx+0x14] (meters, default
-        // 4.8) to the global camera-params block [0x07C25720]:
-        //   +0x00 vmovss xmm0,[rcx+0x14]   ; rcx = active preset, +0x14 = distance
-        //   +0x05 vmovss [rip->global],xmm0 ; publish  <- hook lands ON this boundary
-        //   +0x0D vmovaps xmm0,[rcx+0x30]  ; rest of the block copy (FOV +0x18, ...)
-        // Expected 4 hits (RVA 0x0095A91F / 0x01F9245F / 0x0268DA8F / 0x02DB617F) -
-        // branch/caller copies; which one runs depends on game mode, so hook ALL FOUR
-        // (like GfxCorruption; over-hooking is harmless, each publish is scaled exactly
-        // once). Hook +0x5: after the 5-byte load, before the 8-byte rip-relative
-        // publish store (safetyhook relocates the rip operand - same class as our
-        // FPSCap/Nameplate sites). Multiplying the PUBLISHED value never compounds:
-        // the preset source field is never written, so re-publishing starts from the
-        // unscaled 4.8 every time.
-        std::vector<uint8_t*> CamDistPresetHits = Memory::PatternScanAll(baseModule, "C5 FA 10 41 14 C5 FA 11 05 ?? ?? ?? ?? C5 F8 28 41 30 C5 F8");
-        if (!CamDistPresetHits.empty())
-        {
-            LogInfo("HIT: CamDistPreset: %zu hit(s)", CamDistPresetHits.size());
-            if (CamDistPresetHits.size() != 4)
-                LogError("WARN: CamDistPreset: expected 4 hits, found %zu - hooking all of them anyway", CamDistPresetHits.size());
-
-            static std::vector<SafetyHookMid> CamDistPresetMidHooks;
-            for (uint8_t* hit : CamDistPresetHits)
-            {
-                LogInfo("HIT: CamDistPreset: %s+0x%llx (hook at +0x5)", sExeName.c_str(), ModOffset(hit));
-                CamDistPresetMidHooks.push_back(safetyhook::create_mid(hit + 0x5,
-                    [](SafetyHookContext& ctx)
-                    {
-                        static std::atomic<bool> logged{ false };
-                        if (!logged.exchange(true)) LogInfo("FIRED: CamDistPreset (dist %g -> %g)", ctx.xmm0.f32[0], ctx.xmm0.f32[0] * fCamDistMulti);
-
-                        ctx.xmm0.f32[0] *= fCamDistMulti;
-                    }));
-            }
-        }
-        else
-        {
-            LogError("MISS: CamDistPreset pattern not found - camera distance multiplier (preset path) disabled");
-        }
-
-        // F2 - FollowCamDist: the follow-camera's 1/2/3-channel zoom-track selector
-        // (popcnt on a channel mask) loads the zoom value into xmm8 from
-        // [rdi+0x17C/+0x180/+0x184] (or vxorps xmm8 when no channel); all arms converge
-        // on "vxorps xmm9,xmm9,xmm9" at +0x23 - hook there (5-byte insn, boundary
-        // verified; next insn "mov rax,[rsi]" confirms a clean split). The value is a
-        // NORMALIZED [0..1] pull-back fraction, NOT meters - downstream the game
-        // computes dist = min(1, max(0, xmm8+xmm7)) when flag [obj+0x5B5C]&0x80 is set,
-        // so a multiplier > 1 pulls back and SATURATES at the far end of the zoom
-        // range via that clamp (expected behavior).
-        uint8_t* FollowCamDistScanResult = Memory::PatternScan(baseModule, "C5 7A 10 ?? 7C 01 00 00 EB ?? C4 41 38 57 C0 EB ?? C5 7A 10 ?? 80 01 00 00 EB ?? C5 7A 10 ?? 84 01 00 00 C4 41 30 57 C9");
-        if (FollowCamDistScanResult)
-        {
-            LogInfo("HIT: FollowCamDist: %s+0x%llx (hook at +0x23)", sExeName.c_str(), ModOffset(FollowCamDistScanResult));
-
-            static SafetyHookMid FollowCamDistMidHook{};
-            FollowCamDistMidHook = safetyhook::create_mid(FollowCamDistScanResult + 0x23,
-                [](SafetyHookContext& ctx)
-                {
-                    static std::atomic<bool> logged{ false };
-                    if (!logged.exchange(true)) LogInfo("FIRED: FollowCamDist (zoom %g -> %g)", ctx.xmm8.f32[0], ctx.xmm8.f32[0] * fCamDistMulti);
-
-                    // xmm8 may be 0 on the vxorps arm - multiplying is harmless there.
-                    ctx.xmm8.f32[0] *= fCamDistMulti;
-                });
-        }
-        else
-        {
-            LogError("MISS: FollowCamDist pattern not found - camera distance multiplier (follow-cam path) disabled");
-        }
-
-        // F3 - RoamCamDist: free-roam camera config copy (same camera-apply function
-        // family as CamDistPreset hit #1):
-        //   +0x00 vmovss xmm0,[rsi+0x38]   ; free-roam distance
-        //   +0x05 vmovss [rcx+0x54],xmm0   ; <- hook here
-        //   +0x0A vmovss xmm0,[rsi+0x3C]   ; second field - intentionally NOT scaled
-        //   +0x0F vmovss [rcx+0x58],xmm0
-        // Expected unique hit RVA 0x0095A625; hook +0x5 (after the load, before the
-        // 5-byte store). Only the copied value is scaled; the source [rsi+0x38] is
-        // untouched, so re-copies never compound.
-        uint8_t* RoamCamDistScanResult = Memory::PatternScan(baseModule, "C5 FA 10 ?? 38 C5 FA 11 ?? 54 C5 FA 10 ?? 3C C5 FA 11 ?? 58");
-        if (RoamCamDistScanResult)
-        {
-            LogInfo("HIT: RoamCamDist: %s+0x%llx (hook at +0x5)", sExeName.c_str(), ModOffset(RoamCamDistScanResult));
-
-            static SafetyHookMid RoamCamDistMidHook{};
-            RoamCamDistMidHook = safetyhook::create_mid(RoamCamDistScanResult + 0x5,
-                [](SafetyHookContext& ctx)
-                {
-                    static std::atomic<bool> logged{ false };
-                    if (!logged.exchange(true)) LogInfo("FIRED: RoamCamDist (dist %g -> %g)", ctx.xmm0.f32[0], ctx.xmm0.f32[0] * fCamDistMulti);
-
-                    ctx.xmm0.f32[0] *= fCamDistMulti;
-                });
-        }
-        else
-        {
-            LogError("MISS: RoamCamDist pattern not found - camera distance multiplier (free-roam path) disabled");
-        }
-    }
+        LogInfo("Legacy CamDistPreset/FollowCamDist/RoamCamDist hooks disabled; CamDistCommit is the sole distance multiplier");
 
     if (bFOVFix && (fAspectRatio < fNativeAspect))
     {
@@ -1478,61 +1148,10 @@ void AspectFOVFix()
 }
 
 // =====================================================================================
-// CamDistCommit - the SHIPPING camera distance multiplier ([Gameplay Camera Distance]
-// Multiplier). Both build flavors, NOT dev-gated. Provenance: offline hunt CAMDIST_HUNT3
-// + in-game FIRED verification 2026-07-11 (docs/PATTERNS.md 2.9/3.24/3.26, ADR-0013).
-// Confidence: HIGH.
-//
-// Hook site: the committed-eye store at RVA 0x00692497, inside the register-base
-// per-frame eye/at committer function 0x00691F60. This is the writer that the first five
-// disp32-xref hunts all missed - it writes eye/at register-relative ([rsi+0x10]/[rsi+0x20],
-// rsi=ctx), which no rip-relative cross-reference can see. The old rip-relative 4-site
-// "CamCommitDist" (0x01A2D8F3 / 0x01F4185F / 0x01FF3AAC / 0x0320150C) it superseded was
-// field-proven DEAD (0 fires every DIAG-CAM2 session) and has been REMOVED - see the
-// historical note in docs/PATTERNS.md 3.24.
-//
-// The writer body computes eye/at, then commits (disasm-verified on the deployed exe):
-//   0x00692487  vaddps  xmm1, xmm0, [rsi+0x110]   ; at  (live in xmm1)
-//   0x0069248F  vaddps  xmm0, xmm0, [rsi+0x100]   ; eye (live in xmm0)
-//   0x00692497  vmovaps [rsi+0x10], xmm0          ; *** COMMIT EYE ***   <== HOOK (+0x0)
-//   0x0069249C  vmovaps [rsi+0x20], xmm1          ; *** COMMIT AT  ***
-//   0x006924A1  vmovaps xmm0, [rsi+0x120]         ; up load
-//   0x006924A9  vmovaps [rsi+0x30], xmm0          ; commit up
-//   0x006924AE  mov rcx, rsi
-//   0x006924B1  call 0x007513C0                   ; rebuild view matrix
-// Called 10x/frame from the fixed dispatch loop in 0x00231A00; call #0 =
-// "lea rcx,[0x07C25360]; call 0x00691F60" -> ctx0 = the static main view.
-//
-// EYE-STORE pattern (offline-verified UNIQUE, scan=1 @ RVA 0x00692497):
-//   C5 F8 29 46 10  C5 F8 29 4E 20  C5 F8 28 86 20 01 00 00  C5 F8 29 46 30
-//   i.e. vmovaps[rsi+0x10] , vmovaps[rsi+0x20] , vmovaps xmm0,[rsi+0x120] , vmovaps[rsi+0x30]
-// The pattern STARTS at the eye store, so the hook offset is +0x0 - a clean 5-byte VEX
-// instruction boundary (safetyhook has the eye store + the following at store = 10
-// relocatable bytes, > the 5 a rel32 detour needs; verified no code jumps into the range).
-// At the hook: rsi = ctx, xmm0 = eye (about to be stored), xmm1 = at.
-//
-// Semantics (Form A, register-only, no memory writes): when rsi == g_pCamCtx0 (main view
-// ONLY - the 9 aux views are left untouched), scale the eye about the look-at:
-//     xmm0.xyz = xmm1.xyz + (xmm0.xyz - xmm1.xyz) * fCamDistMulti     (xmm0 lane 3 = w kept)
-// The committer runs once per view per frame (verified), so NO idempotency guard is needed.
-//
-// Gameplay-only BY GATE (verified): the function's entry gate `cmp byte [rcx+0xC0],0;
-// jnz ...` closes during cutscenes and dialogue, so the eye store is never reached then -
-// fires_ctx0 freezes, gateskip climbs. This multiplier therefore does NOT touch scripted
-// cutscene/dialogue camera framing - distinct from ProjMatrixFOV/ADR-0011, which DOES
-// affect cutscenes (it sits at the projection builder, downstream of any such gate).
-//
-// KNOWN LIMITATION: camera wall-collision is computed UPSTREAM of this commit, so
-// multiplier > 1 can clip/push the eye into walls near geometry (documented, not fixed).
-//
-// Install gate: fCamDistMulti != 1.0 (product) OR - dev builds only - [Debug - Camera]
-// CamDiag = true (so the DIAG counting + |eye-at| watchdog stream F still work at 1.0).
-// At m == 1.0 with CamDiag off the hook is never installed -> zero overhead when unused.
-//
-// ONE hook on 0x00692497 in every flavor (verify: exactly one SafetyHookMid on this
-// address). In dev builds the single body ALSO does the DIAG-CAM2 counting when CamDiag
-// is set; in release it only multiplies. The dev-only ENTRY counting hook (0x00691F60,
-// gate-skip measurement) and the DIAG-CAM2 message counter live under #ifdef below.
+// Scale the main-view eye position about its look-at point, preserving the W lane.
+// Build 24719688 commits eye/at at RVA 0x68CC67 after its virtual camera update.
+// When scripted-camera exclusion is enabled, ctx+0xB8 suppresses scaling.
+// Development builds can install this hook at multiplier 1 for observation.
 void CamDistCommit()
 {
 #ifdef GBFR_DEVBUILD
@@ -1545,18 +1164,46 @@ void CamDistCommit()
     if (!bWantHook)
         return;   // m == 1.0 and (release, or dev with CamDiag off) -> zero overhead
 
-    // Static main-view ctx: resolved once, only COMPARED against rsi (never dereferenced
-    // through the hook). base + 0x07C235A0 = ctx0 (v2.0.4; v2.0.3 was 0x07C22320, v2.0.2
-    // 0x07C25360 - v2.0.4 rebased the whole .data +0x1280 in the recompile; re-pinned and
-    // xref-confirmed live (43 refs, matching the v2.0.3 baseline). CAMDIST_HUNT2/3, PATTERNS.md 2.8/2.9).
-    // Steam build 24719688 (PE 0x6A7DA26E): the first of ten view-update calls
-    // at RVA 0x22ADA9 loads ctx0 = 0x07C23820. The old address silently rejects
-    // every live main-view update. Keep the prior verified build supported too.
+    // Build 24719688: the first of ten view-update arguments at RVA 0x22ADA9
+    // resolves to the primary view at RVA 0x7C23820.
     const uintptr_t mainViewRva = Memory::ModuleTimestamp(baseModule) == 0x6A7DA26E
         ? 0x07C23820 : 0x07C235A0;
     g_pCamCtx0 = reinterpret_cast<const uint8_t*>((uintptr_t)baseModule + mainViewRva);
 
-    // --- The one mid-hook on the eye store 0x00692497 (multiply + dev counting) ---
+    // Count writer entries independently of the final eye-store path.
+#ifdef GBFR_DEVBUILD
+    if (bCamDiag)
+    {
+        uint8_t* EntryHit = Memory::PatternScan(baseModule,
+            "56 53 48 81 EC 88 00 00 00 C5 F8 29 74 24 70 80 B9 C0 00 00 00 00");
+        if (EntryHit)
+        {
+            LogInfo("HIT: CamDistCommit entry(counter): %s+0x%llx (dev counter at +0x0)",
+                sExeName.c_str(), ModOffset(EntryHit));
+            static SafetyHookMid CamDistEntryCounterHook{};
+            CamDistEntryCounterHook = safetyhook::create_mid(EntryHit,
+                [](SafetyHookContext& ctx)
+                {
+                    if (reinterpret_cast<const uint8_t*>(ctx.rcx) == g_pCamCtx0)
+                        g_CamCommitEntriesCtx0.fetch_add(1, std::memory_order_relaxed);
+                });
+        }
+        else
+        {
+            LogError("MISS: CamDistCommit entry(counter) pattern not found");
+        }
+    }
+#endif
+
+    // The main-view virtual update (vtable+0x20, RVA 0x941C00) reads this
+    // DWORD at RVAs 0x941ED6/0x941F77 and clears it at RVA 0x941F84.
+    // It executes before the committed-eye writer, allowing a same-frame gate.
+    if (bExcludeScriptedCameras && Memory::ModuleTimestamp(baseModule) != 0x6A7DA26E)
+    {
+        LogError("CamDist: scripted-state offset has not been verified for this build; distance hook disabled");
+        return;
+    }
+
     uint8_t* EyeStoreHit = Memory::PatternScan(baseModule,
         "C5 F8 29 46 10 C5 F8 29 4E 20 C5 F8 28 86 20 01 00 00 C5 F8 29 46 30");
     if (EyeStoreHit)
@@ -1620,12 +1267,23 @@ void CamDistCommit()
                     const float at0 = ctx.xmm1.f32[0];
                     const float at1 = ctx.xmm1.f32[1];
                     const float at2 = ctx.xmm1.f32[2];
+                    const float dx = ctx.xmm0.f32[0] - at0;
+                    const float dy = ctx.xmm0.f32[1] - at1;
+                    const float dz = ctx.xmm0.f32[2] - at2;
+                    const float fDist = sqrtf(dx * dx + dy * dy + dz * dz);
+
+                    if (bExcludeScriptedCameras)
+                    {
+                        const uint32_t state = *reinterpret_cast<const uint32_t*>(ctx.rsi + 0xB8);
+                        const bool suspended = state != 0;
+                        const bool wasSuspended = g_ScriptedCameraActive.exchange(suspended, std::memory_order_relaxed);
+                        if (suspended != wasSuspended)
+                            LogInfo("Camera Distance: native camera state=%u; multiplier %s (no timer)",
+                                state, suspended ? "SUSPENDED" : "RESUMED");
+                        if (suspended) return;
+                    }
                     if (!g_CamDistFiredLog.exchange(true))
                     {
-                        const float dx = ctx.xmm0.f32[0] - at0;
-                        const float dy = ctx.xmm0.f32[1] - at1;
-                        const float dz = ctx.xmm0.f32[2] - at2;
-                        const float fDist = sqrtf(dx * dx + dy * dy + dz * dz);
                         LogInfo("FIRED: CamDistCommit (main view) - |eye-at| %g -> %g (x%g, eye dollied about look-at)",
                             fDist, fDist * fCamDistMulti, fCamDistMulti);
                     }
@@ -1641,8 +1299,9 @@ void CamDistCommit()
             return;
         }
         if (bMulti)
-            LogInfo("CamDistCommit: multiplier %g installed (main view eye dollied about the look-at; cutscenes unaffected by the [rcx+0xC0] gate). "
-                "Known limitation: wall-collision is computed upstream, so m > 1 can clip the eye into walls.", fCamDistMulti);
+            LogInfo("CamDistCommit: multiplier %g installed (main view eye dollied about the look-at; scripted-camera exclusion %s). "
+                "Known limitation: wall-collision is computed upstream, so m > 1 can clip the eye into walls.",
+                fCamDistMulti, bExcludeScriptedCameras ? "enabled" : "disabled");
 #ifdef GBFR_DEVBUILD
         else
             LogInfo("CamDistCommit: installed in DIAG counting mode ([Debug - Camera] CamDiag, multiplier %g) - eye untouched; DIAG-CAM2 stream F reports fires_ctx0 / fires_other / gateskip / |eye-at|", fCamDistMulti);
@@ -1654,34 +1313,10 @@ void CamDistCommit()
     }
 
 #ifdef GBFR_DEVBUILD
-    // --- Dev + CamDiag only: the ENTRY counting hook 0x00691F60 (gate-skip measure) ---
-    // A SECOND, read-only hook (distinct address from the eye store above). Counts ctx0
-    // entries BEFORE the internal [rcx+0xC0] gate; a call whose gate is closed returns
-    // before the eye store, so gateskip = entries_ctx0 - fires_ctx0. Verifies the
-    // gameplay-only-by-gate property. Pattern offline-verified UNIQUE, scan=1 @ 0x00691F60.
+    // The shared entry hook above supplies g_CamCommitEntriesCtx0. Keep the remaining
+    // diagnostic-only message probes under the CamDiag gate.
     if (bCamDiag)
     {
-        uint8_t* EntryHit = Memory::PatternScan(baseModule,
-            "56 53 48 81 EC 88 00 00 00 C5 F8 29 74 24 70 80 B9 C0 00 00 00 00");
-        if (EntryHit)
-        {
-            LogInfo("HIT: CamDistCommit entry(counter): %s+0x%llx (read-only counting hook at +0x0, pre-gate)",
-                sExeName.c_str(), ModOffset(EntryHit));
-
-            static SafetyHookMid CamDistEntryCounterHook{};
-            CamDistEntryCounterHook = safetyhook::create_mid(EntryHit,
-                [](SafetyHookContext& ctx)
-                {
-                    // rcx = ctx at function entry, BEFORE the [rcx+0xC0] gate. READ ONLY.
-                    if (reinterpret_cast<const uint8_t*>(ctx.rcx) == g_pCamCtx0)
-                        g_CamCommitEntriesCtx0.fetch_add(1, std::memory_order_relaxed);
-                });
-        }
-        else
-        {
-            LogError("MISS: CamDistCommit entry(counter) pattern not found - gate-skip count unavailable (infer from framerate instead)");
-        }
-
         // DIAG-CAM2 stream D: id-6 camera-message consumer counter - v1's distance path.
         // Pattern verified unique offline @ RVA 0x00A840D7 (CAMDIST_HUNT2 4.2):
         //   +0x00  mov eax, [rsi+0x18]     ; payload id  <== COUNTING HOOK
@@ -1719,33 +1354,6 @@ void HUDFix()
 {
     if (bHUDFix)
     {
-        // [REWORKED v2.0.2] v1's "UIAspect" trick (force the UI ortho width to 16:9) is
-        // the wrong tool for v2 and has been REPLACED (hunt_scalecrop.txt). In v2 every
-        // named canvas (41 of them, all 3840x2160 units, center pivot) is mapped to the
-        // screen through a single scale chosen at RVA 0x0015FAB8:
-        //     scaleX = windowRefW / 3840, scaleY = windowRefH / 2160
-        //     scale  = scaleX + (scaleY - scaleX) * t     with t HARDCODED to 0
-        // i.e. always fill-width. On 21:9 the 16:9 canvas then overflows vertically by
-        // (W/3840)/(H/2160) = 1.34375 and the whole frame looks zoomed/cropped.
-        // NOPing the lerp's multiply ("vmulss xmm1,xmm1,xmm2" at pattern+0x18) turns the
-        // expression into scaleX + (scaleY - scaleX) = scaleY -> fit-height: the UI sits
-        // in the centered 16:9 area (the v1 look), and the scene-crop-factor fix in the
-        // ScreenEffects hook lets the 3D span the full window width.
-        //
-        // [NEW 2026-07-10] UIMarkersCanvas - the REAL markers fix. The lerp result is stored
-        // to the global canvas manager right after the pattern:
-        //     +0x28  vmovss [rax+0x17C], xmm0   ; scaleX  (rax = canvas manager [0x07C02358])
-        //     +0x30  vmovss [rax+0x180], xmm1   ; -scaleY (negated for y-flip)
-        //     +0x38  vmovss [rax+0x184], xmm0   ; scale
-        //     +0x40  mov rsi, [rip+...]         ; <- hook here, rax still = canvas manager
-        // World-anchored widgets (enemy HP bars, damage numbers, lock-on) compute
-        //     canvasX = screenX/scale - canvasW/2
-        // and rendering maps that back through windowW/2 + canvasX*scale, so positions are
-        // only correct while canvasW*scale == windowW. Vanilla fill-width satisfies this;
-        // our fit-height NOP broke it (uniform +440px right shift at 3440x1440). Writing
-        // canvasW = 2160*aspect (>16:9) / canvasH = 3840/aspect (<16:9) at the same site
-        // that stores the scale restores the invariant for all ~51 inlined projection
-        // copies at once. (Offline analysis: hunt_uimarkers.txt + 2026-07-10 session.)
         uint8_t* CanvasScaleScanResult = Memory::PatternScan(baseModule, "C5 FA 59 05 ?? ?? ?? ?? C5 F2 59 0D ?? ?? ?? ?? C5 F2 5C C8");
         if (CanvasScaleScanResult)
         {
@@ -1823,10 +1431,6 @@ void HUDFix()
         // ~51x and reads the global canvas manager, fixed by UIMarkersCanvas above.
         // Full story in docs/adr/0006-canvas-manager-invariant-fix.md.
 
-        // Runtime-verified consumers of the manager W (2026-07-10 diagnostic session):
-        // the "HP bar shaped" positioner fn 0x02648970 and fn 0x02652B90 both fired in
-        // combat reading W=5160 from the manager; the shared WorldToScreen helper is
-        // RVA 0x00962FD0. Kept here as breadcrumbs for the next game-version port.
 
         // [FIXED v2.0.2] Span backgrounds - struct offsets shifted -0x38, width now in xmm1,
         // <16:9 hook moved base+0x28 -> base+0x29 (v1 offset landed inside the 8-byte vmovss xmm4,[rax+0x1C0])
@@ -1877,18 +1481,6 @@ void HUDFix()
                         float fObjectHeight = *reinterpret_cast<float*>(ctx.rax + 0x1C0);
 
 #ifdef GBFR_DEVBUILD
-                        // Probe diagnostic ([Debug - Backgrounds] Probe, dev builds
-                        // only): one greppable PROBE-BG line per unique object id
-                        // (first 512 - menus/lobby alone consume ~100 unique ids, and
-                        // 64 slots were exhausted ~30s after boot before any combat
-                        // VFX could appear; field-tested 2026-07-10) - ALL ids
-                        // passing this site, not only w==3840, in
-                        // case a target quad is authored at a non-3840 width. Capture
-                        // workflow for un-whitelisted full-screen overlay quads (e.g.
-                        // the Io charge-complete flash, GitHub issue #1): ids whose
-                        // FIRST sighting lands at the artifact moment are the
-                        // candidates to add to BackgroundWidthIDs. A single bool check
-                        // when disabled; release builds compile this whole block out.
                         if (bBackgroundProbe)
                         {
                             constexpr int kBgProbeCap = 512;
@@ -1980,57 +1572,6 @@ void HUDFix()
 
     if (bSpanHUD)
     {
-        // [REWORKED 2026-07-10] Span HUD - three-layer menu/story filter, derived from
-        // independent analysis of the v2.0.2 exe (build 0x6A3E573A) and cross-validated
-        // against community ultrawide research.
-        //
-        // Site (pattern hit RVA 0x0261C638, hook at +0x1C - both unchanged since v1):
-        //   +0x00 mov   rax,[rcx+0x108]      ; rcx = child element, rax = parent canvas
-        //   +0x07 test  rax,rax / jz +0x26   ; jz jumps PAST +0x1C, so parent != null here
-        //   +0x0C vmovss xmm2,[rax+0x1BC]    ; parent width  (3840 on a full canvas)
-        //   +0x14 vmovss xmm0,[rax+0x1C0]    ; parent height (2160 on a full canvas)
-        //   +0x1C vmovsd xmm1,[rax+0x194]    ; <<== hook here
-        // Child struct (v2.0.2 layout, -0x38 vs v1): +0x19C px.x | +0x1A4 anchorA.x |
-        // +0x1AC anchorB.x | +0x1BC w | +0x1C0 h | +0x1C4 id.
-        //
-        // Why the rewrite: the previous body was Lyall's v1 ID-gated logic - none of the
-        // v1 object IDs ever appear on v2.0.2, and +0x194/+0x198 are normalized anchors,
-        // not pixel offsets, so it was inert (ADR-0006 appendix). Replaced with logic
-        // field-tested on this exact exe build:
-        //   (A) refresh the game's nameplate scale global (see NameplateFix)
-        //   (B) EdgeSnapIds / MoveIds (dev builds only): ini-driven per-child-id px.x
-        //       overrides, applied BEFORE any blocklist decision so specific menu
-        //       elements (e.g. corner button prompts) can be pushed to the true screen
-        //       edge. Position only. Compiled out of release builds.
-        //   (C) Combat Prompts recenter: children of host 2939675107 with 0.5/0.5 anchors
-        //       and |px.x| >= 1600 -> px.x = capturedBase * fAspectMultiplier (wide only)
-        //   (D) gameplay HUD root 1719602056: widen unconditionally
-        //   (E) SpanAllHUD "register mode": widen every full-canvas (3840x2160) parent,
-        //       EXCEPT fixed-anchor children of menu/story containers. Three block layers:
-        //       parent id in kSpanHudBlocklist, parent id in the transitive menuTree
-        //       (seeded with 3 menu roots; a marked parent marks its children on sight;
-        //       never cleared), or child id in kSpanHudChildBlock. Stretch-anchored
-        //       children (anchorA.x != anchorB.x) are widened even inside menus.
-        // Widen writes are REGISTER-ONLY (wide: xmm2 = 2160*fHUDAspectRatio, narrow:
-        // xmm0 = 3840/fHUDAspectRatio) - no struct memory is touched in the widen paths,
-        // unlike the removed v1 marker-based struct writes.
-        //
-        // [Debug - Span HUD] Probe = true (dev builds only) additionally logs every
-        // unique child id that flows through here (bounded, first 512) with geometry +
-        // verdict - the workflow for discovering ids to feed into EdgeSnapIds /
-        // MoveIds. Costs one bool check when disabled; release builds compile the
-        // whole probe machinery out (probeLog becomes a no-op).
-        //
-        // Interaction with UIMarkersCanvas (ADR-0006): that hook rewrites the GLOBAL
-        // canvas manager's source/current width to 2160*fAspectRatio. If the manager
-        // object itself ever flows through this site as "parent", its width is no longer
-        // 3840 and the full-canvas gate here simply skips it - which is correct either
-        // way, the root is already widened. The intended targets of this gate are the 41
-        // named 3840x2160 canvases, whose own W/H the ADR-0006 fix leaves untouched.
-        //
-        // Confidence: HIGH on site semantics (verified disasm, runtime-tested on this
-        // build); MEDIUM on ID-list completeness - hence the span diagnostics
-        // below, which name the first 20 unique widened child ids for post-test triage.
         uint8_t* HUDConstraintsScanResult = Memory::PatternScan(baseModule, "48 ?? ?? ?? ?? ?? 00 48 ?? ?? 74 ?? C5 ?? ?? ?? ?? ?? ?? 00 C5 ?? ?? ?? ?? ?? ?? 00 C5 ?? ?? ?? ?? ?? ?? 00 EB ??");
         if (HUDConstraintsScanResult)
         {
@@ -2292,8 +1833,6 @@ void HUDFix()
                         return; // exactly 16:9 - nothing widened, skip diagnostics
                     probeLog("widen");
 
-                    // Diagnostics: count widened children and log the first 20 unique ids
-                    // (parent id, child id, child w/h) for post-test triage of bad ids.
                     {
                         static std::mutex diagMtx;
                         static uint32_t seenIds[64];
@@ -2329,33 +1868,6 @@ void HUDFix()
 
 void NameplateFix()
 {
-    // [NEW 2026-07-10] Nameplate Fix - derived from independent analysis of the v2.0.2
-    // exe (build 0x6A3E573A), cross-validated against community ultrawide research.
-    //
-    // Site (expected unique hit RVA 0x00847F6B; long, fully concrete pattern):
-    //   +0x00 mov rcx,[rax+0x60]
-    //   +0x04 vmovss xmm1,[rcx+0x9A0]        ; width
-    //   +0x0C vmovss [g_hudW],xmm1           ; rip-relative game global
-    //   +0x14 mov rcx,[rax+0x60]
-    //   +0x18 vmovss xmm1,[rcx+0x9A4]        ; height
-    //   +0x20 vmovss [g_hudH],xmm1
-    //   +0x28 mov rax,[rax+0x60]
-    //   +0x2C vmovss xmm7,[g_scale]          ; game global, ~1.0
-    //   +0x34 vdivss xmm1,xmm7,[rax+0x9D0]   ; xmm1 = scale / hudProjectionAspect
-    //   +0x3C vmovss [g_npScale],xmm1        ; <<== hook here (pattern+0x3C), before the store
-    // Hook: xmm1 = (xmm7 != 0 ? xmm7 : 1.0) / fAspectRatio - divide by the LIVE screen
-    // aspect (NOT 1.7778): [rax+0x9D0] is the HUD-projection aspect that our other hooks
-    // force/alter, so re-deriving the quotient from the true aspect re-projects
-    // world-anchored nameplates correctly. Register-only; the site's own store then
-    // publishes the corrected value to the game's scale global.
-    //
-    // g_pNameplateScalar: the store target at +0x3C, resolved from the instruction's own
-    // rip-relative disp32 at scan time (never hardcoded; byte-checked first). The Span
-    // HUD hook refreshes it to 1/fAspectRatio every pass so the value stays corrected on
-    // frames where this site does not run.
-    //
-    // Install gates: bFixNameplates ([Fix Nameplates] Enabled) AND fAspectRatio > 16:9.
-    // Confidence: HIGH (concrete 0x3C-byte pattern, runtime-tested on this build).
     if (!bFixNameplates)
         return;
     if (fAspectRatio <= fNativeAspect)
@@ -2565,40 +2077,6 @@ static void DiagDump()
 }
 
 #ifdef GBFR_DEVBUILD
-// [DEV 2026-07-10] DIAG-CAM2 - camera-distance observation watchdog (dev builds
-// only, armed by [Debug - Camera] CamDiag = true in GBFRUltrawide.dev.ini).
-//
-// Replaces the retired DIAG-CAMDIST watchdog. Its two questions are answered:
-//   - the "preset distance global" 0x07C25720 is mainView+0x3C0 - the static view
-//     ctx's preset-publish tail, COLD (zero rip-visible readers; field sessions
-//     showed a constant 4.8). Stream retired, stop watching it.
-//   - the camera-object +0x9D0/+0x9D4 stream served the FOV hunt concluded by
-//     ADR-0011.
-// Offline hunt #2 (CAMDIST_HUNT2, 2026-07-10) mapped the real registry: the 8-slot
-// view-context table 0x054BF400 (index [0x07021320]), slot 0 = the STATIC main view
-// ctx @ 0x07C25360. Live camera distance is GEOMETRIC - |eye - at| of the ctx's
-// committed pair - not a hot scalar global. This watchdog implements the hunt's
-// observation plan (PATTERNS.md 3.25); it now runs ALONGSIDE the shipping
-// CamDistCommit multiplier as a monitoring instrument (it gated Run B originally):
-//   A) committed |eye-at| (0x07C25370/0x07C25380) + staged |eye-at| (0x07C25670/
-//      0x07C25680), log on change beyond epsilon, with running min/max. Units are
-//      meters (verified 0.679..6.566 m in-game, CAMDIST_HUNT3).
-//   C) behavior object [0x07C25438]: type id (+0x40) and the +0x1398/+0x139C
-//      distance family (cm) - sampled for reference (does NOT drive the live path;
-//      CAMDIST_HUNT2 showed +0x1398 is not the live scalar).
-//   D) id-6 camera-message liveness counter, every ~5s on change - decides MsgCamDist
-//      eligibility (v1's dead path; expect 0 in v2 gameplay).
-//   E) mode flag bytes [0x07C25711] (manual/photo cam) / [0x07C25713] (recommit) -
-//      labels the samples by camera mode.
-//   F) CAMDIST_HUNT3 live-writer counters (fires_ctx0/fires_other/gateskip/|eye-at|)
-//      from the SHIPPING 0x00692497 mid-hook - the real per-frame commit site. See
-//      the stream-F block below. (The old stream B - four dead rip-relative commit
-//      sites - was removed with that hook; only stream F carries commit counts now.)
-// All statics are v2.0.4 RVAs (module timestamp 1785723813), same version-pinned
-// convention as DiagDump. Heap reads (behavior object) are VirtualQuery-guarded
-// (ADR-0002 defensive practice); exe-image statics are always committed.
-// Everything logs ON CHANGE only, greppable prefix "DIAG-CAM2:", shared hard budget
-// 128 lines per session.
 static bool DiagSafeRead(uintptr_t addr, void* out, size_t size)
 {
     MEMORY_BASIC_INFORMATION mbi{};
@@ -2634,7 +2112,7 @@ static void DiagCam2Watchdog()
     const uintptr_t flagManual   = mainView + 0x3B1;
     const uintptr_t flagRecommit = mainView + 0x3B3;
 
-    LogInfo("DIAG-CAM2: watchdog armed - main view %s+0x%llx; 1s sampling, counters every 5s, budget %d lines",
+    LogInfo("DIAG-CAM2: watchdog armed - main view %s+0x%llx; 100ms sampling, counters every 5s, budget %d lines",
         sExeName.c_str(), ModOffset(const_cast<uint8_t*>(g_pCamCtx0)), kMaxLines);
 
     // Stream A state (distances; units unknown - log raw).
@@ -2652,6 +2130,7 @@ static void DiagCam2Watchdog()
     // Stream C state (behavior object; floats compared bitwise so a NaN field
     // cannot burn the budget every tick).
     unsigned long long lastObj = 0;
+    unsigned long long lastVtable = 0;
     int      lastType = 0;
     uint32_t lastBDistBits = 0, lastBDist2Bits = 0;
     bool bHaveBehavior = false;
@@ -2673,7 +2152,7 @@ static void DiagCam2Watchdog()
     int iTick = 0;
     while (iLines < kMaxLines)
     {
-        Sleep(1000);
+        Sleep(100);
         ++iTick;
 
         // A) committed + staged |eye-at|.
@@ -2704,8 +2183,8 @@ static void DiagCam2Watchdog()
             }
         }
 
-        // D) id-6 camera-message consumer counter, every 5th tick, on change.
-        if (iLines < kMaxLines && (iTick % 5) == 0)
+        // D) id-6 camera-message consumer counter, every 50th tick, on change.
+        if (iLines < kMaxLines && (iTick % 50) == 0)
         {
             const uint32_t msgCount = g_MsgCam6Count.load(std::memory_order_relaxed);
             if (!bHaveCounters || msgCount != lastMsgCount)
@@ -2731,7 +2210,7 @@ static void DiagCam2Watchdog()
         //                 gate closed before the eye store; 0 = gate open = gameplay;
         //                 climbs during cutscenes/dialogue = gameplay-only-by-gate)
         //   |eye-at|    = min..max of the live main-view eye/at distance (meters)
-        if (iLines < kMaxLines && (iTick % 5) == 0)
+        if (iLines < kMaxLines && (iTick % 50) == 0)
         {
             const uint32_t fc0 = g_CamCommitFiresCtx0.load(std::memory_order_relaxed);
             const uint32_t foth = g_CamCommitFiresOther.load(std::memory_order_relaxed);
@@ -2767,20 +2246,41 @@ static void DiagCam2Watchdog()
             if (DiagSafeRead(behaviorPtr, &obj, sizeof(obj)) && obj)
             {
                 int type = 0;
+                unsigned long long vtable = 0;
                 uint32_t bDistBits = 0, bDist2Bits = 0;
-                if (DiagSafeRead((uintptr_t)obj + 0x40, &type, sizeof(type))
+                if (DiagSafeRead((uintptr_t)obj, &vtable, sizeof(vtable))
+                    && DiagSafeRead((uintptr_t)obj + 0x40, &type, sizeof(type))
                     && DiagSafeRead((uintptr_t)obj + 0x1398, &bDistBits, sizeof(bDistBits))
                     && DiagSafeRead((uintptr_t)obj + 0x139C, &bDist2Bits, sizeof(bDist2Bits)))
                 {
-                    if (!bHaveBehavior || obj != lastObj || type != lastType
+                    if (!bHaveBehavior || obj != lastObj || vtable != lastVtable || type != lastType
                         || bDistBits != lastBDistBits || bDist2Bits != lastBDist2Bits)
                     {
                         float bd = 0.0f, bd2 = 0.0f;
                         memcpy(&bd, &bDistBits, sizeof(bd));
                         memcpy(&bd2, &bDist2Bits, sizeof(bd2));
-                        LogInfo("DIAG-CAM2: behavior obj=0x%llx type=0x%x dist(+0x1398)=%g dist2(+0x139C)=%g",
-                            obj, type, bd, bd2);
+                        char rttiName[128] = "<RTTI unavailable>";
+                        unsigned long long col = 0;
+                        uint32_t colFields[6]{};
+                        const uintptr_t moduleBase = reinterpret_cast<uintptr_t>(baseModule);
+                        if (vtable >= sizeof(uintptr_t)
+                            && DiagSafeRead((uintptr_t)vtable - sizeof(uintptr_t), &col, sizeof(col))
+                            && DiagSafeRead((uintptr_t)col, colFields, sizeof(colFields))
+                            && colFields[0] == 1 && colFields[5] == (uint32_t)((uintptr_t)col - moduleBase))
+                        {
+                            char candidate[128]{};
+                            if (DiagSafeRead(moduleBase + colFields[3] + 16, candidate, sizeof(candidate) - 1)
+                                && candidate[0] == '.' && candidate[1] == '?')
+                            {
+                                memcpy(rttiName, candidate, sizeof(rttiName));
+                                rttiName[sizeof(rttiName) - 1] = '\0';
+                            }
+                        }
+                        LogInfo("DIAG-CAM2: behavior obj=0x%llx vtable=%s+0x%llx rtti=%s type=0x%x dist(+0x1398)=%g dist2(+0x139C)=%g",
+                            obj, sExeName.c_str(), (vtable >= moduleBase ? vtable - moduleBase : vtable),
+                            rttiName, type, bd, bd2);
                         lastObj = obj;
+                        lastVtable = vtable;
                         lastType = type;
                         lastBDistBits = bDistBits;
                         lastBDist2Bits = bDist2Bits;

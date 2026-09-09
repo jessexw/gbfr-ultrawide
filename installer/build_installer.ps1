@@ -1,11 +1,11 @@
-﻿# build_installer.ps1
+# build_installer.ps1
 # Compiles GBFRUltrawideSetup.exe with the csc.exe bundled in .NET Framework 4.x,
 # and assembles the full release layout under installer\out\ (exe + payload\).
 # Usage: powershell -ExecutionPolicy Bypass -File installer\build_installer.ps1 [-Version 0.2.0]
 param(
     # Version stamped into the exe (UpdateChecker.CurrentVersion + the assembly's
     # informational version). CI passes the release tag minus the leading 'v'.
-    # Local/dev builds default to 0.0.0-dev, which the update check ranks below every
+    # Unversioned builds default to 0.0.0-dev, which the update check ranks below every
     # real release, so a dev build just shows the newest release as available.
     [string]$Version = '0.0.0-dev'
 )

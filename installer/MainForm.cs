@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -824,7 +824,7 @@ namespace GBFRUltrawideSetup
             }
             else
             {
-                // Installed is newer than anything we know about (dev/local build) - just
+                // Installed is newer than anything we know about (development build) - just
                 // show it, no warning.
                 _lblVersionState.Text = Strings.F("Version.Value", installed);
                 _lblVersionState.ForeColor = SystemColors.ControlText;
